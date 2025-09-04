@@ -10,7 +10,7 @@
 # Note that the program to be executed is mapped by the kernel into the process along with the stage1 loader, even though
 # it will never run there. In order for this to work reliably the stage1 loader must be build position-independent (-pie)
 
-{writeText, writeShellScript, coreutils, which, patchelf, runCommand, gcc9, gnugrep}:
+{writeText, writeShellScript, coreutils, which, patchelf, runCommand, gcc, gnugrep}:
 let
     stage2_loader = writeShellScript "madness_stage2_loader.sh" ''
         # echo "[madness] +$0 $@" >&2
@@ -103,7 +103,7 @@ let
     '';
     # As of 08/19/2021, madness does not build with the GCC 10 toolchain.
     madness_loader = runCommand "madness_stage1_loader" {} ''
-        ${gcc9}/bin/gcc -fPIC -pie -fno-stack-protector -O2 -nostdlib -nostartfiles ${stage1_loader_src} -o $out
+        ${gcc}/bin/gcc -fPIC -pie -fno-stack-protector -O2 -nostdlib -nostartfiles -ffreestanding ${stage1_loader_src} -o $out
     '';
 in {
     inherit madness_loader;
