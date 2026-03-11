@@ -1,45 +1,108 @@
-# Introduction
+# nix-dynld
 
-Madness is a tool that was developed within [Antithesis](https://antithesis.com) to make it easier to run the same piece of software on both [NixOS](https://nixos.org) and on conventional Linux distributions. This is purely an internal tool that we're open-sourcing to help others, it is not required in any way to use Antithesis.
+nix-dynld is a meta-loader for ELF binaries on NixOS. Its goal is to let one binary work on both conventional Linux systems and on NixOS, if the binary uses the conventional loader path `/lib64/ld-linux-x86-64.so.2`.
 
-When you compile a native executable, it hardcodes the location to the ELF program loader, which is a utility provided by your operating system to start executing a program. On most modern Linux distributions, this utility is called [ld-linux.so](https://linux.die.net/man/8/ld-linux.so) and lives in the `/lib64/` directory.
+nix-dynld is inspired by and based on the [Madness](https://antithesis.com/blog/madness/) [project](https://github.com/antithesishq/madness) originally developed by Antithesis Operations LLC.
 
-NixOS works differently. A binary compiled on NixOS will instead hardcode a particular *version* of `ld-linux.so` living under a particular Nix store path. This means that if you take that binary and run it on a different version of Linux, it won't work. But the reverse is also true -- binaries compiled for other versions of Linux will not generally work on NixOS without modification.
+## Motivation (Why this exists)
 
-Madness solves this problem for you. If you install Madness on your NixOS computer, it will create a virtual loader that lives at the standard locations used by non-NixOS systems. That virtual loader will then examine your binary, and pick a real loader out of the Nix store to use. This means that you can now build software that works on NixOS, and deploy the exact same binary on non-NixOS computers, and have it work in both locations.
+On most Linux systems, dynamically linked executables use a conventional ELF interpreter path such as `/lib64/ld-linux-x86-64.so.2`. But NixOS is different. Binaries built on NixOS usually point at a specific loader inside the Nix store. That makes the binary non-portable unless you patch the interpreter path for non-NixOS, but once you do that the same binary no longer runs on plain NixOS without extra help.
 
-# How Do I Use This?
+nix-dynld provides that extra help: a loader at the conventional path which selects a real loader from the Nix store, primarily by inspecting the target binary's RPATH or RUNPATH.
 
-First add the following to your list of module imports:
+## Installation
 
+### Flake usage
+
+This flake exports the module as:
+
+- `nixosModules.default`
+- `nixosModules.dynld`
+
+Example:
+
+```nix
+{
+  inputs.nix-dynld.url = "path:./nix-dynld";
+
+  outputs = { self, nixpkgs, nix-dynld, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        nix-dynld.nixosModules.dynld
+        { dynld.enable = true; }
+      ];
+    };
+  };
+}
 ```
-"${builtins.fetchGit { url = "https://github.com/antithesishq/madness.git"; }}/modules"
+
+### Plain module import
+
+Add this project's module directory to your NixOS imports:
+
+```nix
+{
+  imports = [
+    ./nix-dynld/modules
+  ];
+
+  dynld.enable = true;
+}
 ```
 
-The module can then be turned on by setting `madness.enable = true;` in your NixOS configuration.
+## Behavior
 
-Madness has a feature that for a non-Nix binary will make it try to resolve dynamically which glibc that binary *would* run with in your current environment, and pick an appropriate loader. This feature is disabled by default because today it's implemented by running `ldd`, and `ldd` is [not safe to run on untrusted binaries](https://jmmv.dev/2023/07/ldd-untrusted-binaries.html). You can enable this feature by setting `MADNESS_ALLOW_LDD=1` in your environment. 
+nix-dynld is a two-stage loader. Stage 1 is a freestanding loader entrypoint placed at the conventional loader path. Stage 2 resolves the real loader from the target executable and then `execve`s it.
 
-# FAQ
+The main resolution path is:
 
-## How does this interact with the new options in NixOS 24.05?
+1. Resolve the target executable path.
+2. Read its ELF dynamic metadata directly.
+3. Prefer `DT_RUNPATH`, otherwise `DT_RPATH`.
+4. Treat that raw colon-separated string as a synthetic search path and look for `ld-linux-x86-64.so.2`.
 
-NixOS 24.05 added an option to enable a stub LD (see the [release notes](https://nixos.org/manual/nixos/stable/release-notes#sec-release-24.05-highlights)). This is conceptually similar to Madness, except that rather than try to run your program, it instead prints an error message and refuses to run your program. This is leaps and bounds better than the pre-24.05 situation, where you got an *utterly incomprehensible* error, but we still prefer Madness. If you're running on 24.05, Madness will disable this feature.
+Notes:
 
-## What about the nix-ld project?
+- Neither `$ORIGIN` expansion nor path normalization is performed in that path.
+- Setting environment variable `DYNLD_ALLOW_LDD=1` enables the fallback path for binaries that do not provide a useful Nix-style RPATH/RUNPATH. This is impure and should be treated as a compatibility escape hatch.
+- `LD_PRELOAD` is preserved across the stage1/stage2 handoff.
+- `DYNLD_EXECUTABLE_NAME` is set for the final exec so the resolved executable path is available downstream.
 
-[nix-ld](https://github.com/Mic92/nix-ld) is a project that is once again very similar to Madness conceptually. The difference is that rather than trying to auto-detect which *version* of `ld` to grab from your Nix store, it requires you to specify one with the `NIX_LD` environment variable. There are pros and cons to both approaches. We like the convenience of auto-detection, and have found that it works pretty well. One big advantage of nix-ld is that it correctly preserves the value of `/proc/self/exe` for your process.
+## Building binaries for use with nix-dynld
 
-## Does this handle things like LD_PRELOAD correctly?
+If you build on non-NixOS, many binaries will already work on NixOS once nix-dynld is enabled, provided their shared-library dependencies are available.
 
-Yup! This isn't the most exhaustively tested feature, but Madness does handle this, and we use it in this mode every day.
+If you build on NixOS and want the same binary to run on conventional Linux too, you usually need to do at least two things:
 
-## But how do I actually build an executable that will work both places?
+- Patch the ELF interpreter to `/lib64/ld-linux-x86-64.so.2`, for example with `patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2`.
+- Control your glibc baseline so you do not emit symbol-version requirements newer than the target systems provide.
 
-This is a little beyond the scope of this project, but here are some tips:
+The closer you stay to "only libc" or a mostly static dependency surface, the easier this is.
 
-* If you're building your software on a non-NixOS Linux, there's a good chance that it will Just Work (TM) on Madness-enabled NixOS. If you see errors about missing libraries, try running in a Nix shell that provides those libraries, or try wrapping the binary in a script that exports them with `LD_LIBRARY_PATH`. Obviously the closer you get to something statically linked, or linking only libc, the easier this will be.
+## Compared to nix-ld
 
-* If you're building you software on NixOS, you have to do a few tricks. 
-  - You need to use the [patchelf](https://github.com/NixOS/patchelf) tool to set the hardcoded loader/linker location to the one that works on non-NixOS machines, not the one that points to the Nix store. Something like this: `${pkgs.patchelf}/bin/patchelf $out/myProgram --set-interpreter /lib64/ld-linux-x86-64.so.2`. Madness will make the resulting binary work on NixOS too.
-  - You also probably need to deal with a cluster of issues around glibc versioning. NixOS tends to have a bleeding edge glibc, which means that when you link your program it may pick up [version symbols](https://peeterjoot.com/2019/09/20/an-example-of-linux-glibc-symbol-versioning/) that are not available on the version of Linux your program runs on. You can get around this by linking against an old version of glibc, or you can try using a [linker script](https://ftp.gnu.org/old-gnu/Manuals/ld-2.9.1/html_node/ld_25.html). Note also that the very newest versions of glibc have [changed how certain auxiliary libraries are packaged](https://developers.redhat.com/articles/2021/12/17/why-glibc-234-removed-libpthread), which may require you to screw around with `DT_NEEDED` as well. Alternatively, avoid this whole category of stuff by statically linking your binary with an alternative libc such as [musl](https://www.musl-libc.org/).
+`nix-ld` and `nix-dynld` solve the same high-level problem, but they make
+different tradeoffs.
+
+- `nix-ld` is explicit: you provide `NIX_LD` and usually `NIX_LD_LIBRARY_PATH`, and it forwards into that chosen loader. `nix-dynld` is heuristic: it tries to infer the right loader from the target executable's RPATH or RUNPATH and only falls back to the opt-in ambient path mode when asked.
+- `nix-ld` documents and exposes a larger public env-var surface: `NIX_LD`, `NIX_LD_LIBRARY_PATH`, platform-specific variants, and `NIX_LD_LOG`. `nix-dynld` exposes a much smaller intended surface; the only public switch is `DYNLD_ALLOW_LDD=1`.
+- `nix-ld` explicitly preserves `/proc/self/exe` for the launched process. `nix-dynld` does not currently has that property.
+
+In practice:
+
+- Use `nix-ld` when you want explicit control over loader and library paths.
+- Use `nix-dynld` when you want a loader that can often infer the right Nix store loader automatically from the binary itself.
+
+## NixOS 24.05 stub-ld
+
+NixOS 24.05 introduced the built-in stub LD behavior that prints a clearer error when a foreign dynamically linked binary is launched. nix-dynld disables that stub behavior when enabled and replaces it with the real meta-loader.
+
+## Attribution and license
+
+This project is derived from Madness by Antithesis Operations LLC:
+https://github.com/antithesishq/madness/
+
+nix-dynld is licensed under the BSD 3-Clause License (see `LICENSE`). 
+Copyright (c) 2024, Antithesis. 
+Copyright (c) 2026, [Hex](https://0x484558.dev/) @ [aleph0 s.r.o.](https://aleph0.ai/)
